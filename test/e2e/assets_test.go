@@ -3,10 +3,15 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	pkgassets "github.com/kubevirt/virt-platform-autopilot/pkg/assets"
 )
 
 // UserOverrideFieldSpec identifies an operator-controlled field on an asset
@@ -60,6 +65,7 @@ func (o UserOverrideFieldSpec) PatchDoc() string {
 }
 
 type testAsset struct {
+	MetadataName  string // matches AssetMetadata.Name in metadata.yaml
 	GVK           schema.GroupVersionKind
 	Plural        string
 	Name          string
@@ -92,34 +98,14 @@ var sensitiveKinds = map[string]bool{
 	"MutatingWebhookConfiguration":   true,
 }
 
-// assetsUnderTest lists all phase-1 "install: always" assets from metadata.yaml.
+// assetsUnderTest lists all reconcile_order=1 assets from metadata.yaml.
+// The coverage test validates completeness against the asset catalog.
 // Used by anti-thrashing, alert, and other E2E test suites.
 // Sensitive is derived automatically from sensitiveKinds.
 var assetsUnderTest = initAssets([]testAsset{
+	// Phase 1: Observability
 	{
-		// No Override: any field change on MachineConfig triggers an MCP rollout.
-		GVK:           schema.GroupVersionKind{Group: "machineconfiguration.openshift.io", Version: "v1", Kind: "MachineConfig"},
-		Plural:        "machineconfigs",
-		Name:          "90-worker-swap-online",
-		ClusterScoped: true,
-	},
-	{
-		// No Override: any field change on MachineConfig triggers an MCP rollout.
-		GVK:           schema.GroupVersionKind{Group: "machineconfiguration.openshift.io", Version: "v1", Kind: "MachineConfig"},
-		Plural:        "machineconfigs",
-		Name:          "99-openshift-machineconfig-worker-psi-karg",
-		GateCRD:       "kubedeschedulers.operator.openshift.io",
-		ClusterScoped: true,
-	},
-	{
-		// No Override: any field change on KubeletConfig triggers an MCP rollout.
-		GVK:           schema.GroupVersionKind{Group: "machineconfiguration.openshift.io", Version: "v1", Kind: "KubeletConfig"},
-		Plural:        "kubeletconfigs",
-		Name:          "virt-perf-settings",
-		GateCRD:       "kubeletconfigs.machineconfiguration.openshift.io",
-		ClusterScoped: true,
-	},
-	{
+		MetadataName:  "metrics-service",
 		GVK:           schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Service"},
 		Plural:        "services",
 		Name:          "virt-platform-autopilot-metrics",
@@ -131,6 +117,7 @@ var assetsUnderTest = initAssets([]testAsset{
 		},
 	},
 	{
+		MetadataName:  "metrics-servicemonitor",
 		GVK:           schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor"},
 		Plural:        "servicemonitors",
 		Name:          "virt-platform-autopilot-metrics",
@@ -143,6 +130,7 @@ var assetsUnderTest = initAssets([]testAsset{
 		},
 	},
 	{
+		MetadataName:  "prometheus-alerts",
 		GVK:           schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: "PrometheusRule"},
 		Plural:        "prometheusrules",
 		Name:          "virt-platform-autopilot-alerts",
@@ -154,15 +142,37 @@ var assetsUnderTest = initAssets([]testAsset{
 			Values:      [2]string{"e2e-tampered", "e2e-modified"},
 		},
 	},
+
+	// Phase 1: MachineConfig
 	{
-		// No Override: CRD validation ties spec.type to metadata.name (e.g. type=Logging requires name=logging).
-		GVK:           schema.GroupVersionKind{Group: "observability.openshift.io", Version: "v1alpha1", Kind: "UIPlugin"},
-		Plural:        "uiplugins",
-		Name:          "monitoring",
-		GateCRD:       "uiplugins.observability.openshift.io",
+		MetadataName:  "swap-enable",
+		GVK:           schema.GroupVersionKind{Group: "machineconfiguration.openshift.io", Version: "v1", Kind: "MachineConfig"},
+		Plural:        "machineconfigs",
+		Name:          "90-worker-swap-online",
 		ClusterScoped: true,
 	},
 	{
+		MetadataName:  "psi-enable",
+		GVK:           schema.GroupVersionKind{Group: "machineconfiguration.openshift.io", Version: "v1", Kind: "MachineConfig"},
+		Plural:        "machineconfigs",
+		Name:          "99-openshift-machineconfig-worker-psi-karg",
+		GateCRD:       "kubedeschedulers.operator.openshift.io",
+		ClusterScoped: true,
+	},
+
+	// Phase 1: KubeletConfig
+	{
+		MetadataName:  "kubelet-perf-settings",
+		GVK:           schema.GroupVersionKind{Group: "machineconfiguration.openshift.io", Version: "v1", Kind: "KubeletConfig"},
+		Plural:        "kubeletconfigs",
+		Name:          "virt-perf-settings",
+		GateCRD:       "kubeletconfigs.machineconfiguration.openshift.io",
+		ClusterScoped: true,
+	},
+
+	// Phase 1: Descheduler
+	{
+		MetadataName:  "descheduler-loadaware",
 		GVK:           schema.GroupVersionKind{Group: "operator.openshift.io", Version: "v1", Kind: "KubeDescheduler"},
 		Plural:        "kubedeschedulers",
 		Name:          "cluster",
@@ -182,3 +192,49 @@ func initAssets(assets []testAsset) []testAsset {
 	}
 	return assets
 }
+
+var _ = Describe("Asset catalog coverage", func() {
+	It("should report reconcile_order=1 assets not covered by assetsUnderTest", func() {
+		registry, err := pkgassets.NewRegistry(pkgassets.NewLoader())
+		Expect(err).NotTo(HaveOccurred())
+
+		catalogNames := map[string]bool{}
+		for _, a := range registry.ListAssets(nil) {
+			if a.ReconcileOrder == 1 {
+				catalogNames[a.Name] = true
+			}
+		}
+
+		testNames := map[string]bool{}
+		for _, a := range assetsUnderTest {
+			Expect(a.MetadataName).NotTo(BeEmpty(),
+				fmt.Sprintf("testAsset %s/%s is missing MetadataName", a.GVK.Kind, a.Name))
+			testNames[a.MetadataName] = true
+		}
+
+		var missingFromTests []string
+		for name := range catalogNames {
+			if !testNames[name] {
+				missingFromTests = append(missingFromTests, name)
+			}
+		}
+		sort.Strings(missingFromTests)
+
+		var extraInTests []string
+		for name := range testNames {
+			if !catalogNames[name] {
+				extraInTests = append(extraInTests, name)
+			}
+		}
+		sort.Strings(extraInTests)
+
+		if len(missingFromTests) > 0 {
+			AddReportEntry("WARNING: reconcile_order=1 assets not covered by e2e tests",
+				fmt.Sprintf("%v\nConsider adding testAsset entries to assetsUnderTest in assets_test.go", missingFromTests))
+		}
+		Expect(extraInTests).To(BeEmpty(),
+			fmt.Sprintf("assets in assetsUnderTest but not reconcile_order=1 in metadata.yaml: %v\n"+
+				"ACTION REQUIRED: remove the stale testAsset entries from assetsUnderTest, "+
+				"or verify the asset's reconcile_order in assets/active/metadata.yaml", extraInTests))
+	})
+})

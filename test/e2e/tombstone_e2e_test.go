@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -25,6 +26,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	pkgassets "github.com/kubevirt/virt-platform-autopilot/pkg/assets"
 )
 
 type testTombstone struct {
@@ -309,4 +312,49 @@ var _ = Describe("Tombstone Lifecycle Tests", Ordered, ContinueOnFailure, func()
 	})
 
 	_ = suiteBeforeTime // used implicitly via closure
+})
+
+var _ = Describe("Tombstone catalog coverage", func() {
+	It("tombstonesUnderTest must match all tombstone files in assets/tombstones/", func() {
+		loader := pkgassets.NewLoader()
+		tombstones, err := loader.LoadTombstones()
+		Expect(err).NotTo(HaveOccurred())
+
+		type key struct{ Kind, Name string }
+
+		catalogKeys := map[key]bool{}
+		for _, t := range tombstones {
+			catalogKeys[key{t.GVK.Kind, t.Name}] = true
+		}
+
+		testKeys := map[key]bool{}
+		for _, t := range tombstonesUnderTest {
+			testKeys[key{t.GVK.Kind, t.Name}] = true
+		}
+
+		var missingFromTests []string
+		for k := range catalogKeys {
+			if !testKeys[k] {
+				missingFromTests = append(missingFromTests, fmt.Sprintf("%s/%s", k.Kind, k.Name))
+			}
+		}
+		sort.Strings(missingFromTests)
+
+		var extraInTests []string
+		for k := range testKeys {
+			if !catalogKeys[k] {
+				extraInTests = append(extraInTests, fmt.Sprintf("%s/%s", k.Kind, k.Name))
+			}
+		}
+		sort.Strings(extraInTests)
+
+		if len(missingFromTests) > 0 {
+			AddReportEntry("WARNING: tombstones not covered by e2e tests",
+				fmt.Sprintf("%v\nConsider adding testTombstone entries to tombstonesUnderTest in tombstone_e2e_test.go", missingFromTests))
+		}
+		Expect(extraInTests).To(BeEmpty(),
+			fmt.Sprintf("tombstones in tombstonesUnderTest but not found in assets/tombstones/: %v\n"+
+				"ACTION REQUIRED: remove the stale testTombstone entries from tombstonesUnderTest, "+
+				"or add the corresponding YAML files under assets/tombstones/", extraInTests))
+	})
 })

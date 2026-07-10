@@ -167,6 +167,16 @@ kind: Namespace
 metadata:
   name: openshift-kube-descheduler-operator
 ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-mtv
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: metallb-system
+---
 apiVersion: hco.kubevirt.io/v1
 kind: HyperConverged
 metadata:
@@ -174,7 +184,12 @@ metadata:
   namespace: openshift-cnv
   annotations:
     platform.kubevirt.io/autopilot: "true"
-spec: {}
+    platform.kubevirt.io/enable-mtv: "true"
+    platform.kubevirt.io/enable-metallb: "true"
+spec:
+  featureGates:
+    - name: CPUManager
+      state: Enabled
 EOF
 
     echo "Mock HCO created in openshift-cnv namespace"
