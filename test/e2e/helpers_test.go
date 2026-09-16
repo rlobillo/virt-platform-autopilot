@@ -1269,6 +1269,203 @@ func exclusionEntryYAML(kind, name, namespace string) string {
 	return fmt.Sprintf("- kind: %s\n  name: %s", kind, name)
 }
 
+// --- MachineConfig coalescing test helpers ---
+
+var mcpGVK = schema.GroupVersionKind{
+	Group:   "machineconfiguration.openshift.io",
+	Version: "v1",
+	Kind:    "MachineConfigPool",
+}
+
+// createTestMCP creates a MachineConfigPool that selects MachineConfigs carrying
+// the "machineconfiguration.openshift.io/role=worker" label (matching the kubelet-perf
+// MC) and immediately sets its Updating condition to the requested state.
+func createTestMCP(name string, updating bool) {
+	pool := &unstructured.Unstructured{}
+	pool.SetGroupVersionKind(mcpGVK)
+	pool.SetName(name)
+	ExpectWithOffset(1, unstructured.SetNestedMap(pool.Object, map[string]any{
+		"machineConfigSelector": map[string]any{
+			"matchLabels": map[string]any{
+				"machineconfiguration.openshift.io/role": "worker",
+			},
+		},
+	}, "spec")).To(Succeed())
+	ExpectWithOffset(1, k8sClient.Create(ctx, pool)).To(Succeed(),
+		fmt.Sprintf("should create test MachineConfigPool %s", name))
+	setMCPUpdating(name, updating)
+}
+
+// setMCPUpdating patches the status conditions of a MachineConfigPool so that
+// Updating equals the requested state. Updating=True signals the controller to
+// release any staged MachineConfig updates for pools that select the same MC.
+func setMCPUpdating(name string, updating bool) {
+	updatingStatus := "False"
+	updatedStatus := "True"
+	if updating {
+		updatingStatus = "True"
+		updatedStatus = "False"
+	}
+	patch := fmt.Sprintf(
+		`{"status":{"conditions":[`+
+			`{"type":"Updated","status":%q,"lastTransitionTime":"2026-01-01T00:00:00Z","reason":"test","message":""},`+
+			`{"type":"Updating","status":%q,"lastTransitionTime":"2026-01-01T00:00:00Z","reason":"test","message":""},`+
+			`{"type":"Degraded","status":"False","lastTransitionTime":"2026-01-01T00:00:00Z","reason":"test","message":""},`+
+			`{"type":"RenderDegraded","status":"False","lastTransitionTime":"2026-01-01T00:00:00Z","reason":"test","message":""}]}}`,
+		updatedStatus, updatingStatus)
+	pool := &unstructured.Unstructured{}
+	pool.SetGroupVersionKind(mcpGVK)
+	pool.SetName(name)
+	ExpectWithOffset(1, k8sClient.Status().Patch(ctx, pool, client.RawPatch(types.MergePatchType, []byte(patch)))).To(Succeed(),
+		fmt.Sprintf("should set MachineConfigPool %s Updating=%s", name, updatingStatus))
+}
+
+// deleteTestMCP removes a MachineConfigPool created by createTestMCP. Safe when absent.
+func deleteTestMCP(name string) {
+	pool := &unstructured.Unstructured{}
+	pool.SetGroupVersionKind(mcpGVK)
+	pool.SetName(name)
+	_ = k8sClient.Delete(ctx, pool)
+}
+
+// stagingEntryExists returns a function that reports whether the staging ConfigMap
+// contains an entry for the given MachineConfig name. Suitable for use with
+// Eventually and Consistently.
+func stagingEntryExists(mcName string) func() bool {
+	return func() bool {
+		cm := &corev1.ConfigMap{}
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: operatorNamespace,
+			Name:      "virt-platform-autopilot-mc-staging",
+		}, cm)
+		if err != nil {
+			return false
+		}
+		_, ok := cm.Data[mcName]
+		return ok
+	}
+}
+
+// deleteStagingConfigMap removes the MC staging ConfigMap. Safe when absent.
+func deleteStagingConfigMap() {
+	cm := &corev1.ConfigMap{}
+	cm.SetName("virt-platform-autopilot-mc-staging")
+	cm.SetNamespace(operatorNamespace)
+	_ = k8sClient.Delete(ctx, cm)
+}
+
+// findMCStagedMetric returns the kubevirt_autopilot_machineconfig_update_staged
+// gauge for the given MachineConfig + pool pair. Returns -1 when absent.
+func findMCStagedMetric(mcName, poolName string) float64 {
+	return findMetricValue("kubevirt_autopilot_machineconfig_update_staged", map[string]string{
+		"machineconfig": mcName,
+		"pool":          poolName,
+	})
+}
+
+// tamperKubeletPerfMCIgnitionVersion patches spec.config.ignition.version on the
+// kubelet-perf MC to an older value. The operator manages this field (SSA), so it
+// detects the change as spec drift. Bypassing coalescing on this MC corrects the
+// version, causing MCO to re-render the worker pool config and start a real node
+// rollout. Used by OCP-only coalescing tests that need a genuine MCO rollout.
+func tamperKubeletPerfMCIgnitionVersion() {
+	ref := unstructuredRef(machineConfigGVK, kubeletPerfMCName, "")
+	patch := []byte(`{"spec":{"config":{"ignition":{"version":"3.4.0"}}}}`)
+	EventuallyWithOffset(1, func() error {
+		return k8sClient.Patch(ctx, ref, client.RawPatch(types.MergePatchType, patch))
+	}, timeout, interval).Should(Succeed(), "should tamper kubelet-perf MC ignition version to 3.4.0")
+}
+
+// tamperKubeletPerfMCManagedByLabel patches the managed-by label on the
+// kubelet-perf MachineConfig to "tampered", creating metadata drift that the
+// operator will detect and want to correct on the next reconcile. Used by
+// Kind-based coalescing tests to trigger staging without relying on HCO fields
+// that may not exist in the upstream CRD used for testing.
+func tamperKubeletPerfMCManagedByLabel() {
+	ref := unstructuredRef(machineConfigGVK, kubeletPerfMCName, "")
+	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:"tampered"}}}`, managedByLabel))
+	EventuallyWithOffset(1, func() error {
+		return k8sClient.Patch(ctx, ref, client.RawPatch(types.MergePatchType, patch))
+	}, timeout, interval).Should(Succeed(), "should tamper kubelet-perf MC managed-by label")
+}
+
+// waitForKubeletPerfMCCompliant polls until the kubelet-perf MachineConfig reaches
+// compliance_status==1. Used by coalescing test setup to confirm baseline state.
+func waitForKubeletPerfMCCompliant() {
+	EventuallyWithOffset(1, func() float64 {
+		return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
+	}, 2*timeout, interval).Should(Equal(1.0),
+		"kubelet-perf MachineConfig should reach compliance_status=1 before coalescing tests")
+}
+
+// waitForKubeletPerfMCStaged polls until the kubelet-perf MachineConfig reaches
+// compliance_status==2 (staged/deferred). Used by coalescing test contexts that
+// need to verify staging before triggering a release.
+func waitForKubeletPerfMCStaged() {
+	EventuallyWithOffset(1, func() float64 {
+		return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
+	}, timeout, interval).Should(Equal(2.0),
+		"kubelet-perf MachineConfig should reach compliance_status=2 (staged) before proceeding")
+}
+
+// findRealWorkerMCPName returns the name of the first MachineConfigPool on the
+// cluster whose machineConfigSelector matches the kubelet-perf MC role label.
+// Returns "" when no matching pool exists (e.g. Kind without a real MCO).
+func findRealWorkerMCPName() string {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(mcpGVK.GroupVersion().WithKind("MachineConfigPoolList"))
+	if err := k8sClient.List(ctx, list); err != nil {
+		return ""
+	}
+	for _, pool := range list.Items {
+		selector, _, _ := unstructured.NestedMap(pool.Object, "spec", "machineConfigSelector")
+		labels, _, _ := unstructured.NestedStringMap(selector, "matchLabels")
+		if labels["machineconfiguration.openshift.io/role"] == "worker" {
+			return pool.GetName()
+		}
+	}
+	return ""
+}
+
+// waitForAnyMCPUpdating polls until at least one MachineConfigPool reports
+// Updating=True. Used by OCP coalescing tests to detect that a rollout has started.
+func waitForAnyMCPUpdating(timeout time.Duration) {
+	EventuallyWithOffset(1, func() bool {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(mcpGVK.GroupVersion().WithKind("MachineConfigPoolList"))
+		if err := k8sClient.List(ctx, list); err != nil {
+			return false
+		}
+		for _, pool := range list.Items {
+			conditions, _, _ := unstructured.NestedSlice(pool.Object, "status", "conditions")
+			for _, c := range conditions {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				if cm["type"] == "Updating" && cm["status"] == "True" {
+					return true
+				}
+			}
+		}
+		return false
+	}, timeout, 10*time.Second).Should(BeTrue(),
+		"at least one MachineConfigPool should become Updating=True after trigger MC is applied")
+}
+
+// cleanupCoalescingContext removes all test MCPs and the staging ConfigMap, then
+// waits for the kubelet-perf MC to return to compliance. Call in AfterAll of
+// each Kind-based coalescing context. Touching the HCO triggers a reconcile
+// that restores any tampered label without requiring an HCO field reset.
+func cleanupCoalescingContext(pools ...string) {
+	for _, name := range pools {
+		deleteTestMCP(name)
+	}
+	touchHCO()
+	deleteStagingConfigMap()
+	waitForKubeletPerfMCCompliant()
+}
+
 // restartOperatorPod deletes the operator pod and waits for a replacement pod
 // with a new UID to become Running, then waits for the operator to be healthy.
 func restartOperatorPod() {
