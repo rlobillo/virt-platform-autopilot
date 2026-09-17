@@ -1,3 +1,4 @@
+{{- $maxPods := dig "spec" "deployment" "nodePlacements" "infra" "maxPods" 500 .HCO.Object -}}
 apiVersion: machineconfiguration.openshift.io/v1
 kind: MachineConfig
 metadata:
@@ -21,11 +22,10 @@ kind: KubeletConfiguration
 # according to https://access.redhat.com/articles/6994974
 nodeStatusMaxImages: 500
 
-{{- $maxPods := dig "spec" "deployment" "nodePlacements" "infra" "maxPods" 500 .HCO.Object }}
-maxPods: {{ $maxPods }}
+maxPods: %d
 
 # Auto-size kubelet reserved resources. Default-enabled on worker nodes since
 # OCP 4.21 (OCPNODE-3719, machine-config-operator#5390).
 autoSizingReserved: true
-` | b64enc }}
+` $maxPods | b64enc }}
         mode: 420

@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
@@ -42,6 +43,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -201,7 +203,13 @@ type EventFilter struct {
 // or if it has a Series whose last firing is at/after Since.
 func findEvents(filter EventFilter) []eventsv1.Event {
 	eventList := &eventsv1.EventList{}
-	ExpectWithOffset(1, k8sClient.List(ctx, eventList, client.InNamespace(operatorNamespace))).To(Succeed())
+	listOpts := []client.ListOption{client.InNamespace(operatorNamespace)}
+	if filter.Reason != "" {
+		listOpts = append(listOpts, &client.ListOptions{
+			FieldSelector: fields.OneTermEqualSelector("reason", filter.Reason),
+		})
+	}
+	ExpectWithOffset(1, k8sClient.List(ctx, eventList, listOpts...)).To(Succeed())
 
 	var matched []eventsv1.Event
 	for _, event := range eventList.Items {
@@ -1109,20 +1117,18 @@ func waitForMCPStable() {
 	start := time.Now()
 	By("waiting for all MachineConfigPools to be stable (Updated, not Updating, not Degraded)")
 
-	Eventually(func() (string, error) {
+	allMCPsStable := func() (string, error) {
 		list := &unstructured.UnstructuredList{}
 		list.SetGroupVersionKind(mcpGVK)
 		if err := k8sClient.List(ctx, list); err != nil {
 			return "", fmt.Errorf("listing MachineConfigPools: %w", err)
 		}
-
 		for _, mcp := range list.Items {
 			name := mcp.GetName()
 			conditions, found, err := unstructured.NestedSlice(mcp.Object, "status", "conditions")
 			if err != nil || !found {
 				return fmt.Sprintf("MCP %s has no conditions yet", name), nil
 			}
-
 			condMap := make(map[string]string)
 			for _, c := range conditions {
 				cm, ok := c.(map[string]any)
@@ -1133,15 +1139,22 @@ func waitForMCPStable() {
 				cStatus, _ := cm["status"].(string)
 				condMap[cType] = cStatus
 			}
-
 			if condMap["Updated"] != "True" || condMap["Updating"] != "False" || condMap["Degraded"] != "False" {
 				return fmt.Sprintf("MCP %s not stable: Updated=%s Updating=%s Degraded=%s",
 					name, condMap["Updated"], condMap["Updating"], condMap["Degraded"]), nil
 			}
 		}
 		return "", nil
-	}, 30*time.Minute, 30*time.Second).Should(BeEmpty(),
+	}
+
+	Eventually(allMCPsStable, 30*time.Minute, 30*time.Second).Should(BeEmpty(),
 		"All MachineConfigPools should become stable")
+
+	// MCO can start a second rollout immediately after the first completes (e.g.
+	// when the autopilot's corrections change the rendered config again). Hold the
+	// stability check for 30s to detect that case before the caller proceeds.
+	Consistently(allMCPsStable, 30*time.Second, 5*time.Second).Should(BeEmpty(),
+		"All MachineConfigPools must remain stable — a second MCO rollout may have started")
 
 	elapsed := time.Since(start)
 	GinkgoWriter.Printf("MachineConfigPools stable after %s\n", elapsed.Truncate(time.Second))
@@ -1328,21 +1341,41 @@ func deleteTestMCP(name string) {
 	_ = k8sClient.Delete(ctx, pool)
 }
 
-// stagingEntryExists returns a function that reports whether the staging ConfigMap
-// contains an entry for the given MachineConfig name. Suitable for use with
-// Eventually and Consistently.
+// stagingEntry mirrors the machineConfigStage struct written by the operator into
+// the staging ConfigMap. It is intentionally a local copy so the e2e package
+// does not import internal engine types.
+type stagingEntry struct {
+	StagedAt      time.Time `json:"stagedAt"`
+	DesiredHash   string    `json:"desiredHash"`
+	MatchingPools []string  `json:"matchingPools"`
+}
+
+// getStagingEntry reads and decodes the staging ConfigMap entry for the given
+// MachineConfig name. Returns nil when absent or when the entry cannot be decoded.
+func getStagingEntry(mcName string) *stagingEntry {
+	cm := &corev1.ConfigMap{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{
+		Namespace: operatorNamespace,
+		Name:      "virt-platform-autopilot-mc-staging",
+	}, cm); err != nil {
+		return nil
+	}
+	raw, ok := cm.Data[mcName]
+	if !ok {
+		return nil
+	}
+	var entry stagingEntry
+	if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+		return nil
+	}
+	return &entry
+}
+
+// stagingEntryExists returns a function that reports whether a valid staging
+// entry exists for the given MachineConfig name. Suitable for Eventually/Consistently.
 func stagingEntryExists(mcName string) func() bool {
 	return func() bool {
-		cm := &corev1.ConfigMap{}
-		err := k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: operatorNamespace,
-			Name:      "virt-platform-autopilot-mc-staging",
-		}, cm)
-		if err != nil {
-			return false
-		}
-		_, ok := cm.Data[mcName]
-		return ok
+		return getStagingEntry(mcName) != nil
 	}
 }
 
@@ -1354,58 +1387,24 @@ func deleteStagingConfigMap() {
 	_ = k8sClient.Delete(ctx, cm)
 }
 
-// findMCStagedMetric returns the kubevirt_autopilot_machineconfig_update_staged
-// gauge for the given MachineConfig + pool pair. Returns -1 when absent.
-func findMCStagedMetric(mcName, poolName string) float64 {
-	return findMetricValue("kubevirt_autopilot_machineconfig_update_staged", map[string]string{
+// findMCStagedMetric returns the value of the named machineconfig staging gauge
+// for the given MachineConfig + pool pair. Returns -1 when absent.
+// Pass "kubevirt_autopilot_machineconfig_update_staged" or
+// "kubevirt_autopilot_machineconfig_update_staged_since_seconds" as metric.
+func findMCStagedMetric(mcName, poolName, metric string) float64 {
+	return findMetricValue(metric, map[string]string{
 		"machineconfig": mcName,
 		"pool":          poolName,
 	})
 }
 
-// tamperKubeletPerfMCIgnitionVersion patches spec.config.ignition.version on the
-// kubelet-perf MC to an older value. The operator manages this field (SSA), so it
-// detects the change as spec drift. Bypassing coalescing on this MC corrects the
-// version, causing MCO to re-render the worker pool config and start a real node
-// rollout. Used by OCP-only coalescing tests that need a genuine MCO rollout.
-func tamperKubeletPerfMCIgnitionVersion() {
-	ref := unstructuredRef(machineConfigGVK, kubeletPerfMCName, "")
-	patch := []byte(`{"spec":{"config":{"ignition":{"version":"3.4.0"}}}}`)
-	EventuallyWithOffset(1, func() error {
-		return k8sClient.Patch(ctx, ref, client.RawPatch(types.MergePatchType, patch))
-	}, timeout, interval).Should(Succeed(), "should tamper kubelet-perf MC ignition version to 3.4.0")
-}
-
-// tamperKubeletPerfMCManagedByLabel patches the managed-by label on the
-// kubelet-perf MachineConfig to "tampered", creating metadata drift that the
-// operator will detect and want to correct on the next reconcile. Used by
-// Kind-based coalescing tests to trigger staging without relying on HCO fields
-// that may not exist in the upstream CRD used for testing.
-func tamperKubeletPerfMCManagedByLabel() {
-	ref := unstructuredRef(machineConfigGVK, kubeletPerfMCName, "")
-	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:"tampered"}}}`, managedByLabel))
-	EventuallyWithOffset(1, func() error {
-		return k8sClient.Patch(ctx, ref, client.RawPatch(types.MergePatchType, patch))
-	}, timeout, interval).Should(Succeed(), "should tamper kubelet-perf MC managed-by label")
-}
-
-// waitForKubeletPerfMCCompliant polls until the kubelet-perf MachineConfig reaches
-// compliance_status==1. Used by coalescing test setup to confirm baseline state.
-func waitForKubeletPerfMCCompliant() {
+// waitForMCComplianceStatus polls until the named MachineConfig reaches the given compliance status.
+// Use observability.ComplianceSynced (1.0) or observability.ComplianceDeferred (2.0).
+func waitForMCComplianceStatus(mcName string, status float64) {
 	EventuallyWithOffset(1, func() float64 {
-		return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-	}, 2*timeout, interval).Should(Equal(1.0),
-		"kubelet-perf MachineConfig should reach compliance_status=1 before coalescing tests")
-}
-
-// waitForKubeletPerfMCStaged polls until the kubelet-perf MachineConfig reaches
-// compliance_status==2 (staged/deferred). Used by coalescing test contexts that
-// need to verify staging before triggering a release.
-func waitForKubeletPerfMCStaged() {
-	EventuallyWithOffset(1, func() float64 {
-		return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-	}, timeout, interval).Should(Equal(2.0),
-		"kubelet-perf MachineConfig should reach compliance_status=2 (staged) before proceeding")
+		return captureAssetMetrics("MachineConfig", mcName, "").ComplianceStatus
+	}, 2*timeout, interval).Should(Equal(status),
+		fmt.Sprintf("%s should reach compliance_status=%.0f", mcName, status))
 }
 
 // findRealWorkerMCPName returns the name of the first MachineConfigPool on the
@@ -1427,43 +1426,34 @@ func findRealWorkerMCPName() string {
 	return ""
 }
 
-// waitForAnyMCPUpdating polls until at least one MachineConfigPool reports
-// Updating=True. Used by OCP coalescing tests to detect that a rollout has started.
-func waitForAnyMCPUpdating(timeout time.Duration) {
-	EventuallyWithOffset(1, func() bool {
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(mcpGVK.GroupVersion().WithKind("MachineConfigPoolList"))
-		if err := k8sClient.List(ctx, list); err != nil {
-			return false
-		}
-		for _, pool := range list.Items {
-			conditions, _, _ := unstructured.NestedSlice(pool.Object, "status", "conditions")
-			for _, c := range conditions {
-				cm, ok := c.(map[string]any)
-				if !ok {
-					continue
-				}
-				if cm["type"] == "Updating" && cm["status"] == "True" {
-					return true
-				}
-			}
-		}
-		return false
-	}, timeout, 10*time.Second).Should(BeTrue(),
-		"at least one MachineConfigPool should become Updating=True after trigger MC is applied")
+// tamperAllAssetsParallel calls each asset's TamperFn concurrently. GinkgoRecover
+// is deferred in each goroutine so assertion failures surface correctly.
+func tamperAllAssetsParallel(assets []coalescingAsset) {
+	var wg sync.WaitGroup
+	for _, asset := range assets {
+		asset := asset
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer GinkgoRecover()
+			asset.TamperFn()
+		}()
+	}
+	wg.Wait()
 }
 
 // cleanupCoalescingContext removes all test MCPs and the staging ConfigMap, then
-// waits for the kubelet-perf MC to return to compliance. Call in AfterAll of
-// each Kind-based coalescing context. Touching the HCO triggers a reconcile
-// that restores any tampered label without requiring an HCO field reset.
+// waits for every coalescing asset to return to compliance. Touching the HCO
+// triggers a reconcile that restores any tampered spec field.
 func cleanupCoalescingContext(pools ...string) {
 	for _, name := range pools {
 		deleteTestMCP(name)
 	}
 	touchHCO()
 	deleteStagingConfigMap()
-	waitForKubeletPerfMCCompliant()
+	for _, asset := range coalescingAssetsUnderTest {
+		waitForMCComplianceStatus(asset.Name, 1.0)
+	}
 }
 
 // restartOperatorPod deletes the operator pod and waits for a replacement pod
@@ -1474,7 +1464,7 @@ func restartOperatorPod() {
 	oldUID := operatorPod.UID
 	ExpectWithOffset(1, k8sClient.Delete(ctx, operatorPod)).To(Succeed())
 
-	By("waiting for replacement pod with new UID to become Running")
+	By("waiting for replacement pod with new UID to become Running and Ready")
 	EventuallyWithOffset(1, func() bool {
 		podList := &corev1.PodList{}
 		if err := k8sClient.List(ctx, podList,
@@ -1484,12 +1474,44 @@ func restartOperatorPod() {
 			return false
 		}
 		for _, p := range podList.Items {
-			if p.UID != oldUID && p.Status.Phase == corev1.PodRunning {
-				return true
+			if p.UID == oldUID || p.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			for _, cs := range p.Status.ContainerStatuses {
+				if (cs.Name == "manager" || len(p.Status.ContainerStatuses) == 1) && cs.Ready {
+					return true
+				}
 			}
 		}
 		return false
 	}, timeout, interval).Should(BeTrue(),
-		"replacement operator pod should be Running after deletion")
+		"replacement operator pod should be Running and Ready after deletion")
 	waitForOperatorHealthy()
+}
+
+// setRealMCPPaused patches spec.paused on a real MachineConfigPool.
+// true prevents MCO from draining nodes; false resumes the rollout.
+func setRealMCPPaused(name string, paused bool) {
+	pool := &unstructured.Unstructured{}
+	pool.SetGroupVersionKind(mcpGVK)
+	pool.SetName(name)
+	value := "false"
+	if paused {
+		value = "true"
+	}
+	ExpectWithOffset(1, k8sClient.Patch(ctx, pool,
+		client.RawPatch(types.MergePatchType, []byte(`{"spec":{"paused":`+value+`}}`)))).To(Succeed(),
+		fmt.Sprintf("should set MachineConfigPool %s paused=%v", name, paused))
+}
+
+// workerMCPHasMachines returns true when the named MachineConfigPool has at least
+// one machine assigned. Used to skip tests on compact clusters where the worker pool
+// is empty.
+func workerMCPHasMachines(name string) bool {
+	mcp, err := getUnstructuredResource(mcpGVK, name, "")
+	if err != nil {
+		return false
+	}
+	count, _, _ := unstructured.NestedInt64(mcp.Object, "status", "machineCount")
+	return count > 0
 }

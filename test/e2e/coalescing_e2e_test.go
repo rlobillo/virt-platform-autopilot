@@ -22,25 +22,37 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// coalescingAsset describes a MachineConfig whose coalescing behaviour is
+// exercised by the Kind coalescing suite. Add entries here to extend coverage to more MachineConfigs.
+type coalescingAsset struct {
+	Name     string
+	TamperFn func() // creates detectable spec drift without relying on MCO
+}
+
+var coalescingAssetsUnderTest = []coalescingAsset{
+	{Name: swapMcName, TamperFn: tamperSwapMCIgnitionVersion},
+	{Name: psiWorkerMCName, TamperFn: tamperPSIWorkerMCKernelArg},
+}
+
 const (
-	kubeletPerfMCName            = "95-worker-kubelet-perf-settings"
-	kubeletPerfGateAnnotation    = "platform.kubevirt.io/enable-kubelet-performance-settings"
 	mcCoalescingBypassAnnotation = "platform.kubevirt.io/bypass-mcp-rollout-coalescing"
 	machineConfigPoolCRDName     = "machineconfigpools.machineconfiguration.openshift.io"
 	machineConfigPoolCRDFile     = "test/crds/openshift/machineconfigpool-crd.yaml"
 	// workerMCPName is the test MachineConfigPool created in each coalescing context.
 	// It uses a test-specific prefix to avoid collision with any pre-existing pools.
-	workerMCPName = "test-coalescing-worker"
-	infraMCPName  = "test-coalescing-infra"
+	workerMCPName   = "test-coalescing-worker"
+	infraMCPName    = "test-coalescing-infra"
+	psiWorkerMCName = "99-openshift-machineconfig-worker-psi-karg"
 )
 
 // Coalescing tests manipulate MachineConfigPool status directly via a fake CRD.
 // They are incompatible with real OpenShift clusters where MCO owns MCP state.
-var _ = Describe("MachineConfig Rollout Coalescing E2E Tests", Ordered, Label("coalescing"), func() {
+var _ = Describe("Kind: MachineConfig Rollout Coalescing", Ordered, func() {
 
 	BeforeAll(func() {
 		if isOpenShiftCluster() {
@@ -53,26 +65,29 @@ var _ = Describe("MachineConfig Rollout Coalescing E2E Tests", Ordered, Label("c
 		installCRDFromFile(machineConfigPoolCRDFile)
 		waitForCRDEstablished(machineConfigPoolCRDName)
 
-		By("enabling kubelet-perf gate so the 95-worker-kubelet-perf-settings MC is created")
-		setAnnotation(hcoGVK, hcoName, operatorNamespace, kubeletPerfGateAnnotation, "true")
-		waitForKubeletPerfMCCompliant()
+		By("waiting for all coalescing assets to be compliant")
+		for _, asset := range coalescingAssetsUnderTest {
+			waitForMCComplianceStatus(asset.Name, 1.0)
+		}
 	})
 
 	AfterAll(func() {
-		By("disabling kubelet-perf gate")
-		removeAnnotation(hcoGVK, hcoName, operatorNamespace, kubeletPerfGateAnnotation)
 		deleteStagingConfigMap()
 		removeCRD(machineConfigPoolCRDName)
 	})
 
-	// TC1: MC update staged while MCP is stable (Updating=False).
-	// compliance_status must be 2, staging CM entry created, metric emitted, drift NOT corrected.
-	Context("TC1: MC update staged while MCP stable (Updating=False)", Ordered, func() {
+	// All coalescing assets are tampered in parallel; each must reach compliance_status=2,
+	// get a staging ConfigMap entry with correct fields, and emit the staged metric.
+	// Drift must NOT be corrected while MCP remains stable.
+	Context("MC update staged while MCP stable (Updating=False)", Ordered, func() {
+		var stagedSince time.Time
+
 		BeforeAll(func() {
 			By("creating test worker MCP with Updating=False")
 			createTestMCP(workerMCPName, false)
-			By("tampering kubelet-perf MC managed-by label to create drift")
-			tamperKubeletPerfMCManagedByLabel()
+			By("tampering all coalescing assets in parallel to create concurrent drift")
+			tamperAllAssetsParallel(coalescingAssetsUnderTest)
+			stagedSince = time.Now()
 			touchHCO()
 		})
 
@@ -80,46 +95,88 @@ var _ = Describe("MachineConfig Rollout Coalescing E2E Tests", Ordered, Label("c
 			cleanupCoalescingContext(workerMCPName)
 		})
 
-		It("should set compliance_status=2 (staged/deferred)", func() {
-			Eventually(func() float64 {
-				return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-			}, timeout, interval).Should(Equal(2.0),
-				"compliance_status should be 2 (deferred) while MCP is stable")
+		for _, asset := range coalescingAssetsUnderTest {
+			asset := asset
+			It(fmt.Sprintf("should set compliance_status=2 (staged/deferred) for %s", asset.Name), func() {
+				Eventually(func() float64 {
+					return captureAssetMetrics("MachineConfig", asset.Name, "").ComplianceStatus
+				}, timeout, interval).Should(Equal(2.0),
+					"compliance_status should be 2 (deferred) while MCP is stable")
+			})
+
+			It(fmt.Sprintf("should create a staging ConfigMap entry with correct fields for %s", asset.Name), func() {
+				var entry *stagingEntry
+				Eventually(func() bool {
+					entry = getStagingEntry(asset.Name)
+					return entry != nil
+				}, timeout, interval).Should(BeTrue(),
+					"staging ConfigMap should have an entry for "+asset.Name)
+				Expect(entry.DesiredHash).NotTo(BeEmpty(),
+					"staging entry must have a non-empty desiredHash")
+				Expect(entry.StagedAt).NotTo(BeZero(),
+					"staging entry must have a non-zero stagedAt")
+				Expect(entry.MatchingPools).To(ContainElement(workerMCPName),
+					"staging entry must list the worker pool")
+			})
+
+			It(fmt.Sprintf("should emit machineconfig_update_staged=1 for %s in the worker pool", asset.Name), func() {
+				Eventually(func() float64 {
+					return findMCStagedMetric(asset.Name, workerMCPName, "kubevirt_autopilot_machineconfig_update_staged")
+				}, timeout, interval).Should(Equal(1.0),
+					"machineconfig_update_staged metric should be 1 for "+workerMCPName)
+			})
+
+			It(fmt.Sprintf("should emit a MachineConfigUpdateStaged event for %s", asset.Name), func() {
+				Eventually(func() int {
+					return len(findEvents(EventFilter{Reason: "MachineConfigUpdateStaged", Since: stagedSince, Name: asset.Name}))
+				}, timeout, interval).Should(BeNumerically(">", 0),
+					"MachineConfigUpdateStaged event must be emitted when "+asset.Name+" is staged")
+			})
+		}
+
+		It("should have staging ConfigMap entries for all assets simultaneously", func() {
+			Eventually(func(g Gomega) {
+				cm := &corev1.ConfigMap{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Namespace: operatorNamespace,
+					Name:      "virt-platform-autopilot-mc-staging",
+				}, cm)).To(Succeed())
+				g.Expect(cm.Data).To(And(
+					HaveKey(swapMcName),
+					HaveKey(psiWorkerMCName),
+					HaveLen(len(coalescingAssetsUnderTest)),
+				))
+			}, timeout, interval).Should(Succeed(),
+				"staging ConfigMap must contain one entry per coalescing asset simultaneously")
 		})
 
-		It("should create a staging ConfigMap entry for the MC", func() {
-			Eventually(stagingEntryExists(kubeletPerfMCName), timeout, interval).Should(BeTrue(),
-				"staging ConfigMap should have an entry for "+kubeletPerfMCName)
-		})
-
-		It("should emit machineconfig_update_staged=1 for the worker pool", func() {
-			Eventually(func() float64 {
-				return findMCStagedMetric(kubeletPerfMCName, workerMCPName)
-			}, timeout, interval).Should(Equal(1.0),
-				"machineconfig_update_staged metric should be 1 for "+workerMCPName)
-		})
-
-		It("should keep compliance_status=2 across subsequent reconciles (drift not corrected)", func() {
-			// Trigger extra reconciles to confirm staging is durable.
+		It("should keep all assets at compliance_status=2 across subsequent reconciles (drift not corrected)", func() {
 			touchHCO()
-			Consistently(func() float64 {
-				return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-			}, consistentlyDuration, consistentlyInterval).Should(Equal(2.0),
-				"drift must remain uncorrected while MCP is not Updating")
+			for _, asset := range coalescingAssetsUnderTest {
+				asset := asset
+				Consistently(func() float64 {
+					return captureAssetMetrics("MachineConfig", asset.Name, "").ComplianceStatus
+				}, consistentlyDuration, consistentlyInterval).Should(Equal(2.0),
+					"drift must remain uncorrected while MCP is not Updating")
+			}
 		})
 	})
 
-	// TC2: Staged update released when MCP transitions to Updating=True.
-	// compliance_status returns to 1, staging CM entry removed, metric cleared.
-	Context("TC2: Released when MCP transitions to Updating=True", Ordered, func() {
+	// All assets are staged first; transitioning the MCP releases all of them.
+	Context("Released when MCP transitions to Updating=True", Ordered, func() {
+		var releasedSince time.Time
+
 		BeforeAll(func() {
-			By("creating test worker MCP with Updating=False and staging a drift")
+			By("creating test worker MCP with Updating=False and staging all assets")
 			createTestMCP(workerMCPName, false)
-			tamperKubeletPerfMCManagedByLabel()
+			tamperAllAssetsParallel(coalescingAssetsUnderTest)
 			touchHCO()
-			waitForKubeletPerfMCStaged()
+			for _, asset := range coalescingAssetsUnderTest {
+				waitForMCComplianceStatus(asset.Name, 2.0)
+			}
 
 			By("setting MCP Updating=True to trigger release")
+			releasedSince = time.Now()
 			setMCPUpdating(workerMCPName, true)
 		})
 
@@ -127,80 +184,116 @@ var _ = Describe("MachineConfig Rollout Coalescing E2E Tests", Ordered, Label("c
 			cleanupCoalescingContext(workerMCPName)
 		})
 
-		It("should correct the drift (compliance_status=1)", func() {
-			Eventually(func() float64 {
-				return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-			}, 2*timeout, interval).Should(Equal(1.0),
-				"compliance_status should return to 1 after MCP transitions to Updating")
-		})
+		for _, asset := range coalescingAssetsUnderTest {
+			asset := asset
+			It(fmt.Sprintf("should correct the drift for %s (compliance_status=1)", asset.Name), func() {
+				Eventually(func() float64 {
+					return captureAssetMetrics("MachineConfig", asset.Name, "").ComplianceStatus
+				}, 2*timeout, interval).Should(Equal(1.0),
+					"compliance_status should return to 1 after MCP transitions to Updating")
+			})
 
-		It("should remove the staging ConfigMap entry", func() {
-			Eventually(stagingEntryExists(kubeletPerfMCName), timeout, interval).Should(BeFalse(),
-				"staging ConfigMap entry should be cleared once the update is applied")
-		})
+			It(fmt.Sprintf("should clear the machineconfig_update_staged metric for %s", asset.Name), func() {
+				Eventually(func() float64 {
+					return findMCStagedMetric(asset.Name, workerMCPName, "kubevirt_autopilot_machineconfig_update_staged")
+				}, timeout, interval).Should(Equal(-1.0),
+					"machineconfig_update_staged metric should be absent after release")
+			})
 
-		It("should clear the machineconfig_update_staged metric", func() {
-			Eventually(func() float64 {
-				return findMCStagedMetric(kubeletPerfMCName, workerMCPName)
-			}, timeout, interval).Should(Equal(-1.0),
-				"machineconfig_update_staged metric should be absent after release")
+			It(fmt.Sprintf("should emit a MachineConfigUpdateReleased event for %s", asset.Name), func() {
+				Eventually(func() int {
+					return len(findEvents(EventFilter{Reason: "MachineConfigUpdateReleased", Since: releasedSince, Name: asset.Name}))
+				}, timeout, interval).Should(BeNumerically(">", 0),
+					"MachineConfigUpdateReleased event must be emitted when "+asset.Name+" is released")
+			})
+		}
+
+		It("should remove all staging ConfigMap entries simultaneously", func() {
+			Eventually(func(g Gomega) {
+				cm := &corev1.ConfigMap{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Namespace: operatorNamespace,
+					Name:      "virt-platform-autopilot-mc-staging",
+				}, cm); err != nil {
+					return // CM fully deleted also satisfies no-entries
+				}
+				g.Expect(cm.Data).To(BeEmpty())
+			}, timeout, interval).Should(Succeed(),
+				"staging ConfigMap must be empty after all updates are released")
 		})
 	})
 
-	// TC3: Bypass annotation opts a MC out of staging → immediate apply.
 	// The bypass annotation must be preserved on the live MC after the apply.
-	Context("TC3: Bypass annotation causes immediate apply", Ordered, func() {
+	Context("Bypass annotation causes immediate apply", Ordered, func() {
 		BeforeAll(func() {
 			By("creating test worker MCP with Updating=False")
 			createTestMCP(workerMCPName, false)
 
-			By("setting bypass annotation on the kubelet-perf MC")
-			setAnnotation(machineConfigGVK, kubeletPerfMCName, "", mcCoalescingBypassAnnotation, "true")
+			By("setting bypass annotation on all coalescing assets")
+			for _, asset := range coalescingAssetsUnderTest {
+				setAnnotation(machineConfigGVK, asset.Name, "", mcCoalescingBypassAnnotation, "true")
+			}
 
-			By("tampering kubelet-perf MC managed-by label to create drift")
-			tamperKubeletPerfMCManagedByLabel()
+			By("tampering all coalescing assets in parallel to create drift")
+			tamperAllAssetsParallel(coalescingAssetsUnderTest)
 			touchHCO()
 		})
 
 		AfterAll(func() {
-			removeAnnotation(machineConfigGVK, kubeletPerfMCName, "", mcCoalescingBypassAnnotation)
+			for _, asset := range coalescingAssetsUnderTest {
+				removeAnnotation(machineConfigGVK, asset.Name, "", mcCoalescingBypassAnnotation)
+			}
 			cleanupCoalescingContext(workerMCPName)
 		})
 
-		It("should immediately correct the drift (compliance_status=1)", func() {
-			Eventually(func() float64 {
-				return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-			}, timeout, interval).Should(Equal(1.0),
-				"bypass annotation must cause immediate apply even when MCP is stable")
-		})
+		for _, asset := range coalescingAssetsUnderTest {
+			asset := asset
+			It(fmt.Sprintf("should immediately correct the drift for %s (compliance_status=1)", asset.Name), func() {
+				Eventually(func() float64 {
+					return captureAssetMetrics("MachineConfig", asset.Name, "").ComplianceStatus
+				}, timeout, interval).Should(Equal(1.0),
+					"bypass annotation must cause immediate apply even when MCP is stable")
+			})
 
-		It("should NOT create a staging ConfigMap entry", func() {
-			Consistently(stagingEntryExists(kubeletPerfMCName), consistentlyDuration, consistentlyInterval).Should(BeFalse(),
-				"staging ConfigMap must remain empty when bypass annotation is set")
-		})
+			It(fmt.Sprintf("should preserve the bypass annotation on %s after apply", asset.Name), func() {
+				Eventually(func() string {
+					mc, err := getUnstructuredResource(machineConfigGVK, asset.Name, "")
+					if err != nil {
+						return ""
+					}
+					return mc.GetAnnotations()[mcCoalescingBypassAnnotation]
+				}, timeout, interval).Should(Equal("true"),
+					"bypass annotation must survive the SSA apply and remain on the live MC")
+			})
+		}
 
-		It("should preserve the bypass annotation on the live MC after apply", func() {
-			Eventually(func() string {
-				mc, err := getUnstructuredResource(machineConfigGVK, kubeletPerfMCName, "")
-				if err != nil {
-					return ""
+		It("should NOT create any staging ConfigMap entries for any asset", func() {
+			Consistently(func(g Gomega) {
+				cm := &corev1.ConfigMap{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Namespace: operatorNamespace,
+					Name:      "virt-platform-autopilot-mc-staging",
+				}, cm); err != nil {
+					return // CM absent also satisfies no-entries
 				}
-				return mc.GetAnnotations()[mcCoalescingBypassAnnotation]
-			}, timeout, interval).Should(Equal("true"),
-				"bypass annotation must survive the SSA apply and remain on the live MC")
+				g.Expect(cm.Data).To(BeEmpty())
+			}, consistentlyDuration, consistentlyInterval).Should(Succeed(),
+				"staging ConfigMap must remain empty when bypass annotation is set on all assets")
 		})
 	})
 
-	// TC4: Staging state survives an operator restart.
 	// The staging ConfigMap is the durable source; the in-memory mirror is rebuilt
-	// on the first reconcile after restart and the metric is re-emitted.
-	Context("TC4: Staging survives operator restart", Ordered, func() {
+	// on the first reconcile after restart and all metrics are re-emitted with the
+	// original stagedAt timestamps.
+	Context("Staging survives operator restart", Ordered, func() {
 		BeforeAll(func() {
-			By("creating test worker MCP with Updating=False and staging a drift")
+			By("creating test worker MCP with Updating=False and staging all assets")
 			createTestMCP(workerMCPName, false)
-			tamperKubeletPerfMCManagedByLabel()
+			tamperAllAssetsParallel(coalescingAssetsUnderTest)
 			touchHCO()
-			waitForKubeletPerfMCStaged()
+			for _, asset := range coalescingAssetsUnderTest {
+				waitForMCComplianceStatus(asset.Name, 2.0)
+			}
 
 			By("restarting the operator pod")
 			restartOperatorPod()
@@ -210,82 +303,64 @@ var _ = Describe("MachineConfig Rollout Coalescing E2E Tests", Ordered, Label("c
 			cleanupCoalescingContext(workerMCPName)
 		})
 
-		It("should keep the staging ConfigMap entry after restart", func() {
-			Expect(stagingEntryExists(kubeletPerfMCName)()).To(BeTrue(),
-				"staging ConfigMap entry must persist across operator restarts")
+		It("should keep staging ConfigMap entries for all assets simultaneously after restart", func() {
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: operatorNamespace,
+				Name:      "virt-platform-autopilot-mc-staging",
+			}, cm)).To(Succeed())
+			Expect(cm.Data).To(And(
+				HaveKey(swapMcName),
+				HaveKey(psiWorkerMCName),
+				HaveLen(len(coalescingAssetsUnderTest)),
+			))
 		})
 
-		It("should re-emit machineconfig_update_staged=1 after the first reconcile", func() {
-			Eventually(func() float64 {
-				return findMCStagedMetric(kubeletPerfMCName, workerMCPName)
-			}, timeout, interval).Should(Equal(1.0),
-				"staging metric must be re-emitted from ConfigMap state after restart")
-		})
+		for _, asset := range coalescingAssetsUnderTest {
+			asset := asset
+			It(fmt.Sprintf("should re-emit machineconfig_update_staged=1 for %s after the first reconcile", asset.Name), func() {
+				Eventually(func() float64 {
+					return findMCStagedMetric(asset.Name, workerMCPName, "kubevirt_autopilot_machineconfig_update_staged")
+				}, timeout, interval).Should(Equal(1.0),
+					"staging metric must be re-emitted from ConfigMap state after restart")
+			})
 
-		It("should keep compliance_status=2 — MC still not applied after restart", func() {
-			Consistently(func() float64 {
-				return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-			}, consistentlyDuration, consistentlyInterval).Should(Equal(2.0),
-				"drift must not be corrected after restart while MCP remains stable")
-		})
-	})
+			It(fmt.Sprintf("should preserve the original stagedAt in staged_since_seconds for %s after restart", asset.Name), func() {
+				entry := getStagingEntry(asset.Name)
+				Expect(entry).NotTo(BeNil(), "staging entry must exist in ConfigMap to verify timestamp")
+				expectedSecs := float64(entry.StagedAt.Unix())
+				Eventually(func() float64 {
+					return findMCStagedMetric(asset.Name, workerMCPName, "kubevirt_autopilot_machineconfig_update_staged_since_seconds")
+				}, timeout, interval).Should(BeNumerically("==", expectedSecs),
+					"staged_since_seconds must reflect original StagedAt from ConfigMap, not the restart time")
+			})
+		}
 
-	// TC5: When the MachineConfigPool CRD is absent the operator falls back to
-	// immediate apply (compatibility mode). No staging ConfigMap must be created.
-	Context("TC5: Without MCP CRD → immediate apply (compatibility mode)", Ordered, func() {
-		var prevRestartCount int32
-
-		BeforeAll(func() {
-			By("removing MachineConfigPool CRD to test compatibility mode")
-			prevRestartCount = getManagerRestartCount()
-			removeCRD(machineConfigPoolCRDName)
-			// The operator may or may not restart when the watched CRD disappears.
-			// Wait for it to be healthy regardless.
-			Eventually(func() int32 {
-				return getManagerRestartCount()
-			}, timeout, interval).Should(BeNumerically(">=", prevRestartCount))
-			waitForOperatorHealthy()
-
-			By("triggering drift without any MCP present")
-			tamperKubeletPerfMCManagedByLabel()
-			touchHCO()
-		})
-
-		AfterAll(func() {
-			deleteStagingConfigMap()
-
-			By("reinstalling MachineConfigPool CRD for subsequent contexts")
-			installCRDFromFile(machineConfigPoolCRDFile)
-			waitForCRDEstablished(machineConfigPoolCRDName)
-			waitForOperatorHealthy()
-			waitForKubeletPerfMCCompliant()
-		})
-
-		It("should immediately correct the drift (compliance_status=1)", func() {
-			Eventually(func() float64 {
-				return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-			}, timeout, interval).Should(Equal(1.0),
-				"operator must apply immediately when MachineConfigPool CRD is absent")
-		})
-
-		It("should NOT create a staging ConfigMap entry in compatibility mode", func() {
-			Consistently(stagingEntryExists(kubeletPerfMCName), consistentlyDuration, consistentlyInterval).Should(BeFalse(),
-				"no staging ConfigMap entry must exist when operating without MachineConfigPool CRD")
+		It("should keep all assets at compliance_status=2 after restart (drift not corrected)", func() {
+			for _, asset := range coalescingAssetsUnderTest {
+				asset := asset
+				Consistently(func() float64 {
+					return captureAssetMetrics("MachineConfig", asset.Name, "").ComplianceStatus
+				}, consistentlyDuration, consistentlyInterval).Should(Equal(2.0),
+					"drift must not be corrected after restart while MCP remains stable")
+			}
 		})
 	})
 
-	// TC6 (should-have): When an MC is selected by multiple pools, the first pool
-	// to transition to Updating=True releases the staged update immediately.
-	Context("TC6: First updating pool releases staged update (multi-pool)", Ordered, func() {
+	// to transition to Updating=True releases all staged updates immediately.
+	Context("First updating pool releases staged updates (multi-pool)", Ordered, func() {
 		BeforeAll(func() {
-			By("creating worker and infra MCPs, both Updating=False, both selecting the kubelet-perf MC")
+			By("creating worker and infra MCPs, both Updating=False")
 			createTestMCP(workerMCPName, false)
 			createTestMCP(infraMCPName, false)
-			tamperKubeletPerfMCManagedByLabel()
+			By("tampering all coalescing assets in parallel to create concurrent drift")
+			tamperAllAssetsParallel(coalescingAssetsUnderTest)
 			touchHCO()
-			waitForKubeletPerfMCStaged()
+			for _, asset := range coalescingAssetsUnderTest {
+				waitForMCComplianceStatus(asset.Name, 2.0)
+			}
 
-			By("transitioning infra pool to Updating=True — this should release the staged update")
+			By("transitioning infra pool to Updating=True — this should release all staged updates")
 			setMCPUpdating(infraMCPName, true)
 		})
 
@@ -293,218 +368,248 @@ var _ = Describe("MachineConfig Rollout Coalescing E2E Tests", Ordered, Label("c
 			cleanupCoalescingContext(workerMCPName, infraMCPName)
 		})
 
-		It("should emit machineconfig_update_staged=1 for both pools while staged", func() {
-			// Both pools must have been recorded in the staging entry.
-			// We verify each pool's metric was present before the release by re-checking
-			// on any remaining series (at least one must have appeared).
-			Expect(findMCStagedMetric(kubeletPerfMCName, workerMCPName) == 1.0 ||
-				findMCStagedMetric(kubeletPerfMCName, infraMCPName) == 1.0).To(BeTrue(),
-				"at least one pool staging metric must have been emitted before release")
-		})
-
-		It("should correct the drift when infra pool transitions to Updating=True", func() {
-			Eventually(func() float64 {
-				return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-			}, 2*timeout, interval).Should(Equal(1.0),
-				"the first updating pool must release the staged update regardless of other pools' state")
-		})
-
-		It("should clear all staging metrics after release", func() {
-			Eventually(func() bool {
-				workerGone := findMCStagedMetric(kubeletPerfMCName, workerMCPName) == -1.0
-				infraGone := findMCStagedMetric(kubeletPerfMCName, infraMCPName) == -1.0
-				return workerGone && infraGone
-			}, timeout, interval).Should(BeTrue(),
-				"machineconfig_update_staged metrics must be cleared for all pools after release")
-		})
-	})
-})
-
-// TC7 (should-have): VirtPlatformAutopilotSyncFailed must NOT fire while a
-// MachineConfig update is staged (compliance_status=2 is an expected state,
-// not a failure). Requires OCP with Prometheus.
-var _ = Describe("MC Coalescing: Alert Silence While Staged", Ordered, Label("coalescing", "ocp-only"), func() {
-	BeforeAll(func() {
-		if !isOpenShiftCluster() {
-			Skip("TC7 requires OCP Prometheus — skipping on Kind")
-		}
-		ensureHCOExists()
-		By("enabling kubelet-perf gate")
-		setAnnotation(hcoGVK, hcoName, operatorNamespace, kubeletPerfGateAnnotation, "true")
-		waitForKubeletPerfMCCompliant()
-		By("tampering kubelet-perf MC managed-by label to create drift")
-		tamperKubeletPerfMCManagedByLabel()
-		touchHCO()
-		waitForKubeletPerfMCStaged()
-	})
-
-	AfterAll(func() {
-		if !isOpenShiftCluster() {
-			return
-		}
-		// Force-apply via bypass so the cluster returns to a clean state.
-		setAnnotation(machineConfigGVK, kubeletPerfMCName, "", mcCoalescingBypassAnnotation, "true")
-		touchHCO()
-		waitForKubeletPerfMCCompliant()
-		removeAnnotation(machineConfigGVK, kubeletPerfMCName, "", mcCoalescingBypassAnnotation)
-		removeAnnotation(hcoGVK, hcoName, operatorNamespace, kubeletPerfGateAnnotation)
-		touchHCO()
-		deleteStagingConfigMap()
-		waitForMCPStable()
-	})
-
-	It(fmt.Sprintf("should NOT fire VirtPlatformAutopilotSyncFailed while compliance_status=2 for %s", kubeletPerfMCName), func() {
-		Consistently(func() bool {
-			return queryAlertNotFiring("VirtPlatformAutopilotSyncFailed", 1, 1,
-				"kind", "MachineConfig",
-				"name", kubeletPerfMCName)
-		}, time.Minute, 10*time.Second).Should(BeTrue(),
-			"VirtPlatformAutopilotSyncFailed must NOT fire while update is staged (compliance_status=2 is expected)")
-	})
-})
-
-// TC8 (should-have, OCP-only): Full coalescing lifecycle on a real cluster.
-// Two managed MachineConfigs are staged simultaneously. Applying bypass on the
-// one with a spec change (kubelet-perf) triggers an MCO rollout, which
-// transitions the worker MachineConfigPool to Updating=True. The second MC
-// (swap) "joins the rollout party": its staged correction is released and
-// applied without needing a separate bypass or a second rollout.
-//
-// This test causes a real worker-node rollout and is expected to take 10-30
-// minutes depending on cluster size. It must run on a dedicated test cluster.
-var _ = Describe("MC Coalescing: OCP Lifecycle — bypass triggers rollout that releases staged peer", Ordered, Label("coalescing", "ocp-only", "slow"), func() {
-	const rolloutMCPTimeout = 30 * time.Minute
-
-	BeforeAll(func() {
-		if !isOpenShiftCluster() {
-			Skip("TC8 requires real OCP cluster with MCO — skipping on Kind")
-		}
-		ensureHCOExists()
-		waitForMCPStable()
-
-		By("enabling kubelet-perf gate and waiting for MC to be synced")
-		setAnnotation(hcoGVK, hcoName, operatorNamespace, kubeletPerfGateAnnotation, "true")
-		waitForKubeletPerfMCCompliant()
-
-		By("verifying swap MC is present and synced")
-		Eventually(func() float64 {
-			return captureAssetMetrics("MachineConfig", swapMcName, "").ComplianceStatus
-		}, timeout, interval).Should(Equal(1.0),
-			swapMcName+" must be synced before staging tests")
-
-		// Stage MC #1 (kubelet-perf): tamper ignition version — real spec drift
-		// that the operator manages via SSA. When bypassed and corrected, MCO
-		// detects the spec change and starts a worker-node rollout.
-		By("tampering " + kubeletPerfMCName + " ignition version to create real spec drift")
-		tamperKubeletPerfMCIgnitionVersion()
-		touchHCO()
-
-		// Stage MC #2 (swap): tamper the managed-by label — metadata drift that
-		// MCO does NOT roll out, so it is safe to apply after the rollout window.
-		By("tampering " + swapMcName + " managed-by label to create a second staged update")
-		mcRef := unstructuredRef(machineConfigGVK, swapMcName, "")
-		EventuallyWithOffset(1, func() error {
-			return k8sClient.Patch(ctx, mcRef,
-				client.RawPatch(types.MergePatchType,
-					[]byte(fmt.Sprintf(`{"metadata":{"labels":{%q:"tampered"}}}`, managedByLabel))))
-		}, timeout, interval).Should(Succeed())
-
-		By("waiting for both MCs to reach compliance_status=2 (staged)")
-		Eventually(func() float64 {
-			return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-		}, timeout, interval).Should(Equal(2.0), kubeletPerfMCName+" should be staged")
-		Eventually(func() float64 {
-			return captureAssetMetrics("MachineConfig", swapMcName, "").ComplianceStatus
-		}, timeout, interval).Should(Equal(2.0), swapMcName+" should be staged")
-	})
-
-	AfterAll(func() {
-		if !isOpenShiftCluster() {
-			return
-		}
-		// Ensure bypass is removed regardless of test outcome.
-		removeAnnotation(machineConfigGVK, kubeletPerfMCName, "", mcCoalescingBypassAnnotation)
-		removeAnnotation(hcoGVK, hcoName, operatorNamespace, kubeletPerfGateAnnotation)
-		touchHCO()
-		deleteStagingConfigMap()
-		waitForMCPStable()
-	})
-
-	It("should have both MCs staged with correct metrics before bypass", func() {
-		workerMCPName := findRealWorkerMCPName()
-		Expect(workerMCPName).NotTo(BeEmpty(), "a worker MachineConfigPool must exist on OCP")
-
-		Expect(stagingEntryExists(kubeletPerfMCName)()).To(BeTrue(),
-			"staging CM must have entry for "+kubeletPerfMCName)
-		Expect(stagingEntryExists(swapMcName)()).To(BeTrue(),
-			"staging CM must have entry for "+swapMcName)
-
-		Expect(findMCStagedMetric(kubeletPerfMCName, workerMCPName)).To(Equal(1.0),
-			"machineconfig_update_staged must be 1 for "+kubeletPerfMCName)
-		Expect(findMCStagedMetric(swapMcName, workerMCPName)).To(Equal(1.0),
-			"machineconfig_update_staged must be 1 for "+swapMcName)
-	})
-
-	It("bypass on kubelet-perf MC triggers immediate apply and starts MCO rollout", func() {
-		By("applying bypass annotation to " + kubeletPerfMCName)
-		setAnnotation(machineConfigGVK, kubeletPerfMCName, "", mcCoalescingBypassAnnotation, "true")
-		touchHCO()
-
-		By("verifying " + kubeletPerfMCName + " is applied immediately (compliance_status=1)")
-		Eventually(func() float64 {
-			return captureAssetMetrics("MachineConfig", kubeletPerfMCName, "").ComplianceStatus
-		}, timeout, interval).Should(Equal(1.0),
-			kubeletPerfMCName+" must be applied immediately when bypass annotation is set")
-
-		By("verifying staging CM entry for " + kubeletPerfMCName + " is removed")
-		Eventually(stagingEntryExists(kubeletPerfMCName), timeout, interval).Should(BeFalse())
-
-		By("waiting for MCO to start a worker rollout (MCP Updating=True)")
-		waitForAnyMCPUpdating(rolloutMCPTimeout)
-	})
-
-	It("swap MC staging is released and correction applied as part of the rollout window", func() {
-		workerMCPName := findRealWorkerMCPName()
-
-		By("verifying " + swapMcName + " is released (compliance_status=1)")
-		Eventually(func() float64 {
-			return captureAssetMetrics("MachineConfig", swapMcName, "").ComplianceStatus
-		}, rolloutMCPTimeout, 10*time.Second).Should(Equal(1.0),
-			swapMcName+" staging must be released once MCP transitions to Updating=True")
-
-		By("verifying staging CM entry for " + swapMcName + " is removed")
-		Eventually(stagingEntryExists(swapMcName), timeout, interval).Should(BeFalse())
-
-		By("verifying machineconfig_update_staged metrics are cleared for both MCs")
-		Eventually(func() bool {
-			kubeletGone := findMCStagedMetric(kubeletPerfMCName, workerMCPName) == -1.0
-			swapGone := findMCStagedMetric(swapMcName, workerMCPName) == -1.0
-			return kubeletGone && swapGone
-		}, timeout, interval).Should(BeTrue(),
-			"machineconfig_update_staged must be cleared for both MCs after rollout")
-	})
-
-	It("swap MC managed-by label is restored to correct value after release", func() {
-		Eventually(func() string {
-			mc, err := getUnstructuredResource(machineConfigGVK, swapMcName, "")
-			if err != nil {
-				return ""
+		It("should have emitted machineconfig_update_staged=1 for both pools while staged", func() {
+			for _, asset := range coalescingAssetsUnderTest {
+				asset := asset
+				Expect(findMCStagedMetric(asset.Name, workerMCPName, "kubevirt_autopilot_machineconfig_update_staged") == 1.0 ||
+					findMCStagedMetric(asset.Name, infraMCPName, "kubevirt_autopilot_machineconfig_update_staged") == 1.0).To(BeTrue(),
+					"at least one pool staging metric must have been emitted for "+asset.Name+" before release")
 			}
-			return mc.GetLabels()[managedByLabel]
-		}, timeout, interval).Should(Equal(managedByValue),
-			"managed-by label on "+swapMcName+" must be restored to "+managedByValue+" after staging release")
+		})
+
+		for _, asset := range coalescingAssetsUnderTest {
+			asset := asset
+			It(fmt.Sprintf("should correct the drift for %s when infra pool transitions to Updating=True", asset.Name), func() {
+				Eventually(func() float64 {
+					return captureAssetMetrics("MachineConfig", asset.Name, "").ComplianceStatus
+				}, 2*timeout, interval).Should(Equal(1.0),
+					"the first updating pool must release the staged update regardless of other pools' state")
+			})
+
+			It(fmt.Sprintf("should clear all staging metrics for %s after release", asset.Name), func() {
+				Eventually(func() bool {
+					workerGone := findMCStagedMetric(asset.Name, workerMCPName, "kubevirt_autopilot_machineconfig_update_staged") == -1.0
+					infraGone := findMCStagedMetric(asset.Name, infraMCPName, "kubevirt_autopilot_machineconfig_update_staged") == -1.0
+					return workerGone && infraGone
+				}, timeout, interval).Should(BeTrue(),
+					"machineconfig_update_staged metrics must be cleared for all pools after release")
+			})
+		}
+	})
+})
+
+// MachineConfigPool is paused. While staged, VirtPlatformAutopilotSyncFailed must
+// NOT fire (compliance_status=2 is intentional) and
+// VirtPlatformAutopilotMachineConfigUpdateStaged (severity=info) must fire for each
+// staged MC. Unpausing the pool releases both corrections in a single rollout window,
+// after which VirtPlatformAutopilotMachineConfigUpdateStaged must clear.
+var _ = Describe("OCP: two MachineConfig corrections staged while MCP is paused", Ordered, func() {
+	var realWorkerMCPName string
+	var stagedSince time.Time
+
+	BeforeAll(func() {
+		if !isOpenShiftCluster() {
+			Skip("requires real OCP cluster with MCO and Prometheus — skipping on Kind")
+		}
+		ensureHCOExists()
+		waitForMCPStable()
+
+		realWorkerMCPName = findRealWorkerMCPName()
+		Expect(realWorkerMCPName).NotTo(BeEmpty(), "a worker MachineConfigPool must exist on OCP")
+
+		if !workerMCPHasMachines(realWorkerMCPName) {
+			Skip("worker MCP has no machines — skipping on compact cluster")
+		}
+
+		By("setting PrometheusRule to unmanaged so alert for-durations can be patched")
+		setAnnotation(prometheusRuleGVK, prometheusRuleName, operatorNamespace, modeAnnotation, modeUnmanaged)
+
+		By("reducing alert for-durations to 15s for faster test feedback")
+		patchAlertForDurations("15s")
+
+		By("ensuring baseline: PSI MC and swap MC at compliance_status=1")
+		Eventually(func() float64 {
+			return captureAssetMetrics("MachineConfig", psiWorkerMCName, "").ComplianceStatus
+		}, timeout, interval).Should(Equal(1.0), psiWorkerMCName+" must be synced before staging")
+		Eventually(func() float64 {
+			return captureAssetMetrics("MachineConfig", swapMcName, "").ComplianceStatus
+		}, timeout, interval).Should(Equal(1.0), swapMcName+" must be synced before staging")
+
+		By("pausing worker MCP — MCO will re-render but not drain nodes")
+		setRealMCPPaused(realWorkerMCPName, true)
+
+		By("tampering PSI MC: removing psi=1 kernel argument")
+		tamperPSIWorkerMCKernelArg()
+
+		By("tampering swap MC: downgrading ignition version to 3.4.0")
+		tamperSwapMCIgnitionVersion()
+
+		By("triggering reconcile so the operator detects drift")
+		stagedSince = time.Now()
+		touchHCO()
+
+		By("waiting for both MCs to be staged while MCP is paused (Updating=False)")
+		waitForMCComplianceStatus(psiWorkerMCName, 2.0)
+		waitForMCComplianceStatus(swapMcName, 2.0)
 	})
 
-	It("should emit DriftCorrected event for both MCs", func() {
-		By("verifying DriftCorrected event was emitted after release")
-		Eventually(func() int {
-			return captureAutopilotEvents().DriftCorrected
-		}, timeout, interval).Should(BeNumerically(">=", 2),
-			"at least 2 DriftCorrected events must have been emitted (one per MC)")
+	AfterAll(func() {
+		if !isOpenShiftCluster() {
+			return
+		}
+		By("restoring PrometheusRule to managed mode")
+		removeAnnotation(prometheusRuleGVK, prometheusRuleName, operatorNamespace, modeAnnotation)
+
+		if realWorkerMCPName != "" {
+			setRealMCPPaused(realWorkerMCPName, false)
+		}
+		// Force-apply via bypass so both MCs return to clean state regardless of
+		// where the test failed.
+		for _, mcName := range []string{psiWorkerMCName, swapMcName} {
+			setAnnotation(machineConfigGVK, mcName, "", mcCoalescingBypassAnnotation, "true")
+		}
+		touchHCO()
+		for _, mcName := range []string{psiWorkerMCName, swapMcName} {
+			waitForMCComplianceStatus(mcName, 1.0)
+			removeAnnotation(machineConfigGVK, mcName, "", mcCoalescingBypassAnnotation)
+		}
+		touchHCO()
+		deleteStagingConfigMap()
+		waitForMCPStable()
 	})
 
-	It("rollout completes and cluster returns to stable state", func() {
-		By("waiting for all MachineConfigPools to become stable after rollout")
+	It("should have both MCs staged with CM entries and metrics", func() {
+		for _, mcName := range []string{psiWorkerMCName, swapMcName} {
+			mcName := mcName
+			entry := getStagingEntry(mcName)
+			Expect(entry).NotTo(BeNil(),
+				"staging CM must have an entry for "+mcName)
+			Expect(entry.DesiredHash).NotTo(BeEmpty(),
+				"staging entry for "+mcName+" must have a non-empty desiredHash")
+			Expect(entry.StagedAt).NotTo(BeZero(),
+				"staging entry for "+mcName+" must have a non-zero stagedAt")
+			Expect(entry.MatchingPools).To(ContainElement(realWorkerMCPName),
+				"staging entry for "+mcName+" must list the worker pool")
+			Expect(findMCStagedMetric(mcName, realWorkerMCPName, "kubevirt_autopilot_machineconfig_update_staged")).To(Equal(1.0),
+				"machineconfig_update_staged must be 1 for "+mcName)
+		}
+	})
+
+	It("should emit MachineConfigUpdateStaged events for both MCs", func() {
+		for _, mcName := range []string{psiWorkerMCName, swapMcName} {
+			mcName := mcName
+			Eventually(func(g Gomega) {
+				events := findEvents(EventFilter{Reason: "MachineConfigUpdateStaged", Since: stagedSince, Name: mcName})
+				g.Expect(events).NotTo(BeEmpty(),
+					"MachineConfigUpdateStaged event must be emitted for "+mcName)
+			}, timeout, interval).Should(Succeed())
+		}
+	})
+
+	It("should NOT fire VirtPlatformAutopilotSyncFailed while both MCs are staged", func() {
+		Consistently(func() bool {
+			psiSafe := queryAlertNotFiring("VirtPlatformAutopilotSyncFailed", 1, 1,
+				"kind", "MachineConfig", "name", psiWorkerMCName)
+			swapSafe := queryAlertNotFiring("VirtPlatformAutopilotSyncFailed", 1, 1,
+				"kind", "MachineConfig", "name", swapMcName)
+			return psiSafe && swapSafe
+		}, time.Minute, 10*time.Second).Should(BeTrue(),
+			"VirtPlatformAutopilotSyncFailed must NOT fire while updates are staged (compliance_status=2 is expected)")
+	})
+
+	It("should fire VirtPlatformAutopilotMachineConfigUpdateStaged for both staged MCs", func() {
+		for _, mcName := range []string{swapMcName, psiWorkerMCName} {
+			mcName := mcName
+			Eventually(func() map[string]string {
+				return queryFiringAlert("VirtPlatformAutopilotMachineConfigUpdateStaged", 1, 1,
+					"machineconfig", mcName,
+					"pool", realWorkerMCPName)
+			}, 2*time.Minute, 10*time.Second).Should(And(
+				Not(BeNil()),
+				HaveKeyWithValue("machineconfig", mcName),
+				HaveKeyWithValue("pool", realWorkerMCPName),
+			), "VirtPlatformAutopilotMachineConfigUpdateStaged must fire with correct labels for "+mcName)
+		}
+	})
+
+	It("should release both staged corrections in one rollout window when MCP is unpaused", func() {
+		By("unpausing worker MCP — MCO sees pending spec changes and sets Updating=True")
+		releasedSince := time.Now()
+		setRealMCPPaused(realWorkerMCPName, false)
+		touchHCO()
+
+		By("verifying PSI MC correction released and applied (compliance_status=1)")
+		Eventually(func() float64 {
+			return captureAssetMetrics("MachineConfig", psiWorkerMCName, "").ComplianceStatus
+		}, 2*timeout, interval).Should(Equal(1.0),
+			psiWorkerMCName+" must be corrected once MCP transitions to Updating")
+
+		By("verifying swap MC correction released and applied (compliance_status=1)")
+		Eventually(func() float64 {
+			return captureAssetMetrics("MachineConfig", swapMcName, "").ComplianceStatus
+		}, 2*timeout, interval).Should(Equal(1.0),
+			swapMcName+" must be corrected once MCP transitions to Updating")
+
+		By("verifying staging CM entries cleared for both MCs")
+		Eventually(stagingEntryExists(psiWorkerMCName), timeout, interval).Should(BeFalse(),
+			"staging CM entry for "+psiWorkerMCName+" must be cleared after release")
+		Eventually(stagingEntryExists(swapMcName), timeout, interval).Should(BeFalse(),
+			"staging CM entry for "+swapMcName+" must be cleared after release")
+
+		By("verifying machineconfig_update_staged metrics cleared for both MCs")
+		Eventually(func() bool {
+			psiGone := findMCStagedMetric(psiWorkerMCName, realWorkerMCPName, "kubevirt_autopilot_machineconfig_update_staged") == -1.0
+			swapGone := findMCStagedMetric(swapMcName, realWorkerMCPName, "kubevirt_autopilot_machineconfig_update_staged") == -1.0
+			return psiGone && swapGone
+		}, timeout, interval).Should(BeTrue(),
+			"machineconfig_update_staged must be cleared for both MCs after rollout window")
+
+		By("verifying MachineConfigUpdateReleased events emitted for both MCs")
+		for _, mcName := range []string{psiWorkerMCName, swapMcName} {
+			mcName := mcName
+			Eventually(func() int {
+				return len(findEvents(EventFilter{Reason: "MachineConfigUpdateReleased", Since: releasedSince, Name: mcName}))
+			}, timeout, interval).Should(BeNumerically(">", 0),
+				"MachineConfigUpdateReleased event must be emitted for "+mcName)
+		}
+	})
+
+	It("should clear VirtPlatformAutopilotMachineConfigUpdateStaged alert after rollout", func() {
+		Eventually(func() bool {
+			psiGone := queryAlertNotFiring("VirtPlatformAutopilotMachineConfigUpdateStaged", 1, 1,
+				"machineconfig", psiWorkerMCName)
+			swapGone := queryAlertNotFiring("VirtPlatformAutopilotMachineConfigUpdateStaged", 1, 1,
+				"machineconfig", swapMcName)
+			return psiGone && swapGone
+		}, 2*time.Minute, 10*time.Second).Should(BeTrue(),
+			"VirtPlatformAutopilotMachineConfigUpdateStaged must clear for both MCs after rollout")
+	})
+
+	It("should return to stable MCP state after rollout", func() {
 		waitForMCPStable()
 	})
 })
+
+// tamperPSIWorkerMCKernelArg patches spec.kernelArguments to empty on the PSI
+// worker MachineConfig, removing the psi=1 kernel argument. The operator manages
+// this field via SSA and will detect the drift on the next reconcile.
+func tamperPSIWorkerMCKernelArg() {
+	ref := unstructuredRef(machineConfigGVK, psiWorkerMCName, "")
+	EventuallyWithOffset(1, func() error {
+		return k8sClient.Patch(ctx, ref,
+			client.RawPatch(types.MergePatchType, []byte(`{"spec":{"kernelArguments":[]}}`)))
+	}, timeout, interval).Should(Succeed(),
+		"should remove psi=1 kernel argument from "+psiWorkerMCName)
+}
+
+// tamperSwapMCIgnitionVersion patches spec.config.ignition.version on the swap MC
+// from 3.5.0 to 3.4.0. The operator manages this field via SSA and will detect the
+// drift on the next reconcile.
+func tamperSwapMCIgnitionVersion() {
+	ref := unstructuredRef(machineConfigGVK, swapMcName, "")
+	EventuallyWithOffset(1, func() error {
+		return k8sClient.Patch(ctx, ref,
+			client.RawPatch(types.MergePatchType, []byte(`{"spec":{"config":{"ignition":{"version":"3.4.0"}}}}`)))
+	}, timeout, interval).Should(Succeed(),
+		"should tamper swap MC ignition version to 3.4.0")
+}
