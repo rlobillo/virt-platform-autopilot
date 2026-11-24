@@ -1,0 +1,115 @@
+name: QE Approval Check
+
+# Gates PRs making GA-affecting changes (feature maturity changes, asset
+# changes within GA features, edits to GA asset templates) on QE approval:
+# the check stays red until the qe-approved label is applied. That label is
+# restricted to CNV QE approvers by the openshift/release Prow config, so
+# only QE can turn a flagged PR green.
+#
+# The check is read-only end to end: it never writes labels or PR fields,
+# so it also works for fork PRs, whose pull_request token is read-only.
+# It re-runs automatically on every push and on any label change, so
+# approving with /label qe-approved turns it green without a re-push.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qe-approval-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  qe-approval-gate:
+    name: QE approval gate
+    runs-on: ubuntu-latest
+    if: github.repository == 'openshift-virtualization/virt-platform-autopilot'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # The paths logic lives here instead of an on.paths filter because
+      # that filter's behavior for label-only events (labeled/unlabeled) is
+      # not well defined; the cumulative diff is deterministic for every
+      # event type and lets irrelevant PRs finish green and fast.
+      - name: Detect asset catalog changes
+        id: relevance
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch origin "${BASE_REF}"
+          if git diff --name-only --no-renames "origin/${BASE_REF}...HEAD" \
+              | grep -qE '^assets/active/|^docs/generated/feature-status\.json$'; then
+            echo "Asset catalog changes detected; evaluating QE approval."
+            echo "relevant=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "No asset catalog changes; QE approval not required."
+            echo "relevant=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Setup Go
+        if: steps.relevance.outputs.relevant == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install PyYAML
+        if: steps.relevance.outputs.relevant == 'true'
+        run: pip install pyyaml
+
+      - name: Detect GA-affecting changes
+        id: verdict
+        if: steps.relevance.outputs.relevant == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Regenerate the head artifact so the verdict reflects the actual
+          # derived state of the PR head, even if the author has not run
+          # `make generate-feature-status` yet. A failing generation (invalid
+          # or incomplete catalog) must not bypass the gate: flag instead.
+          if ! make generate-feature-status; then
+            echo "needs_approval=true" >> "${GITHUB_OUTPUT}"
+            echo "needs-approval: true"
+            echo "  - feature-status generation failed (invalid or incomplete catalog)"
+            exit 0
+          fi
+          python3 scripts/check-needs-qe-approval.py --base-rev "origin/${BASE_REF}"
+
+      - name: Enforce QE approval
+        if: steps.relevance.outputs.relevant == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          NEEDS_APPROVAL: ${{ steps.verdict.outputs.needs_approval }}
+        run: |
+          if [ "${NEEDS_APPROVAL}" != "true" ]; then
+            echo "No GA-affecting changes; QE approval not required."
+            exit 0
+          fi
+
+          approved=$(gh pr view "${PR_NUMBER}" --json labels \
+            --jq 'any(.[]; .name == "qe-approved")')
+          if [ "${approved}" = "true" ]; then
+            echo "QE approval granted (qe-approved label present)."
+            exit 0
+          fi
+
+          {
+            echo "## QE approval required"
+            echo
+            echo "This PR makes GA-affecting changes; it cannot merge until CNV"
+            echo "QE agrees on the testing plan. The exact reasons are listed in"
+            echo "the *Detect GA-affecting changes* step log."
+            echo
+            echo "- QE approvers: apply \`/label qe-approved\`"
+            echo "- Anyone: push changes that remove the GA-affecting modifications"
+            echo
+            echo "The check re-runs automatically on every push and label change."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "QE approval required: the qe-approved label is missing."
+          exit 1
