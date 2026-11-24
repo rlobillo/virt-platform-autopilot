@@ -9,7 +9,6 @@ jobs:
   label-needs-qe-approval:
     name: Apply needs-qe-approval on feature maturity changes
     runs-on: ubuntu-latest
-    if: github.repository == 'openshift-virtualization/virt-platform-autopilot'
     permissions:
       issues: write
       pull-requests: write
