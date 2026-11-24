@@ -1,0 +1,41 @@
+name: Label PRs needing QE approval
+
+on:
+  pull_request:
+    paths:
+      - 'assets/active/metadata.yaml'
+
+jobs:
+  label-needs-qe-approval:
+    name: Apply needs-qe-approval on feature maturity changes
+    runs-on: ubuntu-latest
+    if: github.repository == 'openshift-virtualization/virt-platform-autopilot'
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect feature maturity changes
+        id: maturity
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git diff "origin/${BASE_REF}...HEAD" -- assets/active/metadata.yaml | grep -qE '^[+-][[:space:]]*maturity:'; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Apply needs-qe-approval label
+        if: steps.maturity.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh label create needs-qe-approval --color e11d21 --description "Indicates this PR requires qe-approved before it can be merged (e.g. feature maturity changes)" --force
+          gh pr edit "${PR_NUMBER}" --add-label needs-qe-approval
