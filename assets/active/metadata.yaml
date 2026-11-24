@@ -1245,7 +1245,7 @@ features:
 
   - name: File-based Swap Provisioning
     description: Optional cheaper alternative to a dedicated swap partition; provisions file-backed swap sized to each worker's memory overcommitment, skipped on workers that have the dedicated partition. Swap activation remains managed by Swap Enablement
-    maturity: dp
+    maturity: tp
     assets: [file-based-swap-provisioning]
 
   - name: Kubelet Performance
