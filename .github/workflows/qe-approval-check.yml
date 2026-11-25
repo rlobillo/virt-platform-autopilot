@@ -25,7 +25,8 @@ jobs:
   qe-approval-gate:
     name: QE approval gate
     runs-on: ubuntu-latest
-    if: github.repository == 'openshift-virtualization/virt-platform-autopilot'
+    # Repository guard temporarily removed to validate this check on a fork.
+    if: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
