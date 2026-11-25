@@ -94,7 +94,7 @@ jobs:
           fi
 
           approved=$(gh pr view "${PR_NUMBER}" --json labels \
-            --jq 'any(.[]; .name == "qe-approved")')
+            --jq 'any(.labels[]; .name == "qe-approved")')
           if [ "${approved}" = "true" ]; then
             echo "QE approval granted (qe-approved label present)."
             exit 0
