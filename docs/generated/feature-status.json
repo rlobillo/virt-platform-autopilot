@@ -18,17 +18,6 @@
       ]
     },
     {
-      "name": "Kubelet Performance",
-      "description": "Optimized kubelet settings for virtualization workloads. Does not require node reboot; restarts kubelet.",
-      "maturity": "GA",
-      "install": "opt-in",
-      "opt_in": "platform.kubevirt.io/enable-kubelet-performance-settings=true",
-      "assets": [
-        "kubelet-perf-settings",
-        "kubelet-perf-settings-node-disruption-policy"
-      ]
-    },
-    {
       "name": "Load-Aware Descheduler",
       "description": "Load-aware VM balancing based on CPU/memory utilization and pressure stall metrics",
       "maturity": "GA",
@@ -129,6 +118,17 @@
         "ifo-vmi-rules",
         "ifo-vmim-rules",
         "ifo-volumesnapshot-rules"
+      ]
+    },
+    {
+      "name": "Kubelet Performance",
+      "description": "Optimized kubelet settings for virtualization workloads. Does not require node reboot; restarts kubelet.",
+      "maturity": "TP",
+      "install": "opt-in",
+      "opt_in": "platform.kubevirt.io/enable-kubelet-performance-settings=true",
+      "assets": [
+        "kubelet-perf-settings",
+        "kubelet-perf-settings-node-disruption-policy"
       ]
     },
     {
