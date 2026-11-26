@@ -676,10 +676,3 @@ class CommandLineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class DeliberateFailureTest(unittest.TestCase):
-    def test_fails_on_purpose(self):
-        # Deliberate failure to exercise the fail-closed path: the
-        # detection check must go red and the labeler must skip.
-        self.fail("validation: intentional failure")
