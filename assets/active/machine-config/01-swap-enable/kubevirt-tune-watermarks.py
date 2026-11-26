@@ -163,3 +163,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# validation: GA supporting-file edit (swap-enable, via readAsset reference graph)
