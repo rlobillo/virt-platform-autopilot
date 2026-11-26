@@ -7,6 +7,8 @@ metadata:
     app: virt-platform-autopilot
     app.kubernetes.io/name: virt-platform-autopilot
     app.kubernetes.io/component: autopilot
+    # validation: GA asset template edit (should trigger ga-assets-changed)
+    validation/ga-asset-edit: "true"
   annotations:
     # Requests a TLS serving certificate from the OpenShift service-ca operator,
     # mounted into the operator pod to serve metrics over HTTPS (mTLS).

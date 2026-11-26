@@ -24,7 +24,7 @@ jobs:
   detect:
     name: Detect GA assets changes
     runs-on: ubuntu-latest
-    if: github.repository == 'openshift-virtualization/virt-platform-autopilot'
+    if: true  # guards removed for fork validation
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
