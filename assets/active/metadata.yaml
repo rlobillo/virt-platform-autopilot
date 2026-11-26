@@ -1252,7 +1252,7 @@ features:
     description: >-
       Optimized kubelet settings for virtualization workloads. Does not
       require node reboot; restarts kubelet.
-    maturity: tp
+    maturity: ga
     assets:
       - kubelet-perf-settings-node-disruption-policy
       - kubelet-perf-settings
